@@ -41,7 +41,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 Restart Claude Desktop. You'll see a 🔌 icon in the composer; click it to confirm `wima` is
 connected and all 19 tools are listed.
 
-## Tool catalog — 19 Blok 1 tools (DECISIONS §H.4)
+## Tool catalog — 19 Blok 1 tools + 4 storage tools
 
 | Category | Tool | Side-effects beyond the obvious |
 |---|---|---|
@@ -64,10 +64,60 @@ connected and all 19 tools are listed.
 | Write | `add_internal_note` | — |
 | Write | `claim_task` | opens `cowork_session` (unique per active task); reuses if you already hold it |
 | Write | `release_task` | closes session, idempotent |
+| Read  | `download_upload` | fetch a single upload's bytes into `WIMA_WORKSPACE_DIR/<project_id>/<filename>`. Returns the local path — Cowork opens that file directly. Uses service_role. |
+| Read  | `download_task_uploads` | bulk variant — grabs every upload tied to a task, mirrors layout on disk. Best call to make right after `get_task`. |
+| Read  | `get_upload_signed_url` | HTTPS URL valid 30s – 7d. Use when another tool / API needs direct access without going through this MCP. |
+| Read  | `list_workspace_files` | purely local — enumerates what's already cached under `WIMA_WORKSPACE_DIR`. No DB, no network. |
 
 Every tool inserts an `audit_log` row with `source='mcp'`, `admin_worker_id` from the env,
 `tool_category` (read/write), truncated args + result, duration_ms, and error_code when it
 fails. See `SYSTEM_FLOW.md §4` for the rationale.
+
+## Working on client files locally
+
+Cowork workflow now looks like:
+
+```
+get_task(task_id)                   ← metadata, chat, drafts, upload refs
+      │
+      ▼
+download_task_uploads(task_id)      ← pulls every file into the workspace
+      │
+      ▼
+… read via the standard Read / filesystem-MCP tools …
+… run OCR, diff, extract clauses …
+      │
+      ▼
+save_draft(task_id, ...)            ← commit Cowork's output back to Wima
+```
+
+Paths:
+
+| Env var | Default |
+|---|---|
+| `WIMA_WORKSPACE_DIR` | `~/.wima-cowork/workspace` |
+| Per project folder | `$WIMA_WORKSPACE_DIR/<project_id>/` |
+| File name | original filename, preserved |
+
+Caching: `download_upload` / `download_task_uploads` skip the network if the
+local file already exists. Pass `overwrite=true` to force a re-fetch (e.g. after
+the admin re-uploaded a corrected copy).
+
+The storage tools **do not** delete anything remote — cleanup is owner-only
+from Supabase Studio. Deleting the local copy is just `rm`.
+
+### Enabling the download tools
+
+One env var beyond the base config:
+
+```dotenv
+WIMA_SUPABASE_URL=https://YOUR-PROJECT.supabase.co
+WIMA_SUPABASE_SERVICE_KEY=<paste from Supabase Studio → Settings → API → service_role>
+```
+
+Without `WIMA_SUPABASE_SERVICE_KEY`, the four storage tools return a clean
+`UPSTREAM_ERROR: WIMA_SUPABASE_SERVICE_KEY not set …` instead of crashing.
+Everything else (all 19 Blok 1 tools) keeps working.
 
 ## Tools deferred — Blok 4–7
 

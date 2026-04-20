@@ -168,7 +168,12 @@ paste:
       "env": {
         "WIMA_DB_DSN": "postgresql://postgres.<PROJECT_REF>:<PASSWORD>@aws-1-<REGION>.pooler.supabase.com:5432/postgres?sslmode=require",
         "WIMA_ADMIN_WORKER_ID": "87e604e4-36d8-4f06-b86c-615d3cd1ade5",
-        "WIMA_LOG_LEVEL": "INFO"
+        "WIMA_LOG_LEVEL": "INFO",
+
+        "WIMA_SUPABASE_URL": "https://<PROJECT_REF>.supabase.co",
+        "WIMA_SUPABASE_SERVICE_KEY": "<service_role key from Supabase Studio → Settings → API>",
+        "WIMA_DOCUMENTS_BUCKET": "documents",
+        "WIMA_WORKSPACE_DIR": "~/.wima-cowork/workspace"
       }
     }
   }
@@ -183,6 +188,14 @@ paste:
    `echo %cd%\.venv\Scripts\python.exe` in cmd.
 2. Fill the real DSN in `WIMA_DB_DSN` (same one that passed §4).
 3. Set `WIMA_ADMIN_WORKER_ID` to your uuid from §5.
+
+**One optional edit (enables file-download tools):**
+
+4. Paste your Supabase **service_role** key into `WIMA_SUPABASE_SERVICE_KEY`. You can
+   skip this — the 19 Blok 1 tools keep working — but the four storage tools
+   (`download_upload`, `download_task_uploads`, `get_upload_signed_url`,
+   `list_workspace_files`) need it to fetch object bytes from
+   `storage/v1/object/documents/<project_id>/<filename>`.
 
 > **Why repeat the env vars here instead of relying on `.env`?** Claude Desktop
 > spawns the server in a completely clean environment — no shell, no login

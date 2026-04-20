@@ -18,6 +18,7 @@ from pydantic import Field
 
 from wima_mcp.config import CONFIG
 from wima_mcp.db import ToolError, audit, conn, duration_ms_since
+from wima_mcp import storage as wima_storage
 
 logging.basicConfig(
     level=CONFIG.log_level,
@@ -801,6 +802,202 @@ def release_task(task_id: str) -> dict:
                   result={"released": bool(row)},
                   duration_ms=duration_ms_since(t0))
     return {"released": bool(row)}
+
+
+# -----------------------------------------------------------------------------
+# 6. Storage / local workspace (4) — for Cowork to work on files on disk
+# -----------------------------------------------------------------------------
+
+@mcp.tool()
+def download_upload(
+    upload_id: str,
+    overwrite: Annotated[bool, Field(description="re-download even if a local copy exists")] = False,
+) -> dict:
+    """Download one upload from Supabase Storage into the local workspace.
+
+    Returns the local path so subsequent tools (Read / filesystem MCP / shell)
+    can pick it up. Layout: `WIMA_WORKSPACE_DIR/<project_id>/<filename>`.
+    """
+    t0 = time.perf_counter()
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.execute("""
+                SELECT id, project_id, task_id, storage_bucket, storage_path,
+                       original_filename, mime_type, size_bytes
+                  FROM upload WHERE id = %s::uuid
+            """, (upload_id,))
+            row = cur.fetchone()
+            if not row:
+                _audit_error(cur, "download_upload", "read", None,
+                             {"upload_id": upload_id}, "NOT_FOUND", t0)
+                raise ToolError("NOT_FOUND", "upload not found")
+
+            dest = wima_storage.local_path_for(row["project_id"], row["original_filename"])
+            already = dest.exists()
+            bytes_written = None
+            if already and not overwrite:
+                action = "cached"
+            else:
+                try:
+                    bytes_written = wima_storage.download_object(
+                        row["storage_bucket"], row["storage_path"], dest)
+                    action = "downloaded"
+                except Exception as e:
+                    _audit_error(cur, "download_upload", "read", row["task_id"],
+                                 {"upload_id": upload_id}, "UPSTREAM_ERROR", t0)
+                    raise ToolError("UPSTREAM_ERROR", str(e))
+
+            audit(cur, tool_name="download_upload", tool_category="read",
+                  task_id=row["task_id"],
+                  args={"upload_id": upload_id, "overwrite": overwrite},
+                  result={"local_path": str(dest), "action": action,
+                          "bytes": bytes_written or row["size_bytes"]},
+                  duration_ms=duration_ms_since(t0))
+
+    return {
+        "upload_id": str(row["id"]),
+        "original_filename": row["original_filename"],
+        "mime_type": row["mime_type"],
+        "size_bytes": row["size_bytes"],
+        "local_path": str(dest),
+        "action": action,
+    }
+
+
+@mcp.tool()
+def download_task_uploads(
+    task_id: str,
+    overwrite: Annotated[bool, Field(description="re-download even if a local copy exists")] = False,
+) -> dict:
+    """Download every upload attached to a task. Useful before kicking off a draft."""
+    t0 = time.perf_counter()
+    results: list[dict] = []
+    errors: list[dict] = []
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.execute("""
+                SELECT id, project_id, task_id, storage_bucket, storage_path,
+                       original_filename, mime_type, size_bytes
+                  FROM upload WHERE task_id = %s::uuid
+                  ORDER BY created_at ASC
+            """, (task_id,))
+            rows = cur.fetchall()
+            for row in rows:
+                dest = wima_storage.local_path_for(row["project_id"], row["original_filename"])
+                try:
+                    if dest.exists() and not overwrite:
+                        action = "cached"
+                    else:
+                        wima_storage.download_object(
+                            row["storage_bucket"], row["storage_path"], dest)
+                        action = "downloaded"
+                    results.append({
+                        "upload_id": str(row["id"]),
+                        "original_filename": row["original_filename"],
+                        "mime_type": row["mime_type"],
+                        "size_bytes": row["size_bytes"],
+                        "local_path": str(dest),
+                        "action": action,
+                    })
+                except Exception as e:
+                    errors.append({
+                        "upload_id": str(row["id"]),
+                        "original_filename": row["original_filename"],
+                        "error": str(e),
+                    })
+
+            audit(cur, tool_name="download_task_uploads", tool_category="read",
+                  task_id=task_id,
+                  args={"task_id": task_id, "overwrite": overwrite},
+                  result={"count": len(results), "errors": len(errors)},
+                  duration_ms=duration_ms_since(t0))
+    return {
+        "task_id": task_id,
+        "files": results,
+        "error_count": len(errors),
+        "errors": errors,
+        "workspace_dir": str(CONFIG.workspace_dir),
+    }
+
+
+@mcp.tool()
+def get_upload_signed_url(
+    upload_id: str,
+    expires_in_seconds: Annotated[int, Field(ge=30, le=7 * 24 * 3600)] = 3600,
+) -> dict:
+    """Generate a time-limited HTTPS URL for an upload — useful when a tool
+    outside this MCP (browser / external API) needs direct access.
+    Default expiry 1h, maximum 7 days.
+    """
+    t0 = time.perf_counter()
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.execute("""
+                SELECT id, task_id, project_id, storage_bucket, storage_path,
+                       original_filename, mime_type, size_bytes
+                  FROM upload WHERE id = %s::uuid
+            """, (upload_id,))
+            row = cur.fetchone()
+            if not row:
+                _audit_error(cur, "get_upload_signed_url", "read", None,
+                             {"upload_id": upload_id}, "NOT_FOUND", t0)
+                raise ToolError("NOT_FOUND")
+            try:
+                url = wima_storage.create_signed_url(
+                    row["storage_bucket"], row["storage_path"], expires_in_seconds)
+            except Exception as e:
+                _audit_error(cur, "get_upload_signed_url", "read", row["task_id"],
+                             {"upload_id": upload_id}, "UPSTREAM_ERROR", t0)
+                raise ToolError("UPSTREAM_ERROR", str(e))
+            audit(cur, tool_name="get_upload_signed_url", tool_category="read",
+                  task_id=row["task_id"],
+                  args={"upload_id": upload_id, "expires_in_seconds": expires_in_seconds},
+                  result={"ok": True}, duration_ms=duration_ms_since(t0))
+    return {
+        "upload_id": str(row["id"]),
+        "original_filename": row["original_filename"],
+        "mime_type": row["mime_type"],
+        "size_bytes": row["size_bytes"],
+        "signed_url": url,
+        "expires_in_seconds": expires_in_seconds,
+    }
+
+
+@mcp.tool()
+def list_workspace_files(
+    project_id: Annotated[Optional[str], Field(description="filter to one project_id folder")] = None,
+) -> dict:
+    """List files currently cached in the local workspace. Pure local, no DB I/O.
+
+    Use this to check what Cowork already has on disk before re-downloading.
+    """
+    base = CONFIG.workspace_dir
+    items: list[dict] = []
+    if project_id:
+        root = base / str(project_id).replace("/", "_")
+    else:
+        root = base
+    if root.exists():
+        for p in sorted(root.rglob("*")):
+            if not p.is_file():
+                continue
+            try:
+                rel = p.relative_to(base)
+            except ValueError:
+                rel = p
+            stat = p.stat()
+            items.append({
+                "local_path": str(p),
+                "relative_path": str(rel),
+                "size_bytes": stat.st_size,
+                "mtime": int(stat.st_mtime),
+            })
+    return {
+        "workspace_dir": str(base),
+        "scope": str(root),
+        "count": len(items),
+        "files": items,
+    }
 
 
 # -----------------------------------------------------------------------------
