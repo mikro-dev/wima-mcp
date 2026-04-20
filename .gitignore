@@ -1,0 +1,49 @@
+# --- secrets -----------------------------------------------------------------
+# .env carries WIMA_DB_DSN with the Postgres password. Never commit.
+.env
+.env.local
+.env.*.local
+
+# --- python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+downloads/
+wheels/
+*.egg-info/
+*.egg
+MANIFEST
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.pyre/
+
+# --- virtualenvs -------------------------------------------------------------
+.venv/
+.mcp-venv/
+venv/
+env/
+ENV/
+
+# --- editors / OS ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- scratch / logs ----------------------------------------------------------
+*.log
+logs/
+.nox/
+pip-log.txt
+pip-delete-this-directory.txt
