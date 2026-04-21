@@ -1,13 +1,25 @@
-"""Wima MCP server — stdio, 19 Blok 1 tools per DECISIONS §H.4.
+"""Wima MCP server — stdio. Implements the clean-slate QA-gate flow per
+`update.md`:
 
-Run as:
-    python -m wima_mcp
-or via the installed entry point:
-    wima-mcp
+    pending → cowork_working → pending_admin_review →
+             [approve_and_deliver → delivered]
+             [reject_with_revision → revision_needed → cowork_working]
+
+Admin tools (4): approve_and_deliver, reject_with_revision, get_task,
+list_pending_tasks.
+Cowork tools (6): claim_task, save_draft, update_draft, submit_for_review,
+add_internal_note, release_task.
+Plus read/storage helpers kept from the prior surface (uploads, regulations,
+precedents, client profile/knowledge).
+
+All writes are audited via audit_log.
+
+Run as: `python -m wima_mcp` or `wima-mcp` entry point.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from typing import Annotated, Any, Optional
@@ -27,64 +39,74 @@ logging.basicConfig(
 log = logging.getLogger("wima_mcp")
 
 mcp = FastMCP(name="wima", instructions=(
-    "Wima v2 Cowork tool layer. Use these tools to triage inbox tasks, research, "
-    "draft artifacts, and deliver them to clients. Every write is audited. "
-    "Credits are debited only on deliver_artifact (Pay-on-Delivery)."
+    "Wima review-flow tool layer. Cowork agents claim tasks, draft artifacts, "
+    "and submit for admin review. Admins approve-and-deliver in one action or "
+    "reject with structured revision notes. No billing, no CTAs."
 ))
 
 
-# -----------------------------------------------------------------------------
-# 1. Context / Read (6)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Read tools
+# =============================================================================
 
 @mcp.tool()
 def list_pending_tasks(
-    status: Annotated[Optional[list[str]], Field(description="task_status filter; default ['pending','in_progress','awaiting_client']")] = None,
-    tier: Annotated[Optional[list[str]], Field(description="task_tier filter, e.g. ['urgent','standard']")] = None,
-    matter_type: Annotated[Optional[list[str]], Field(description="project_matter_type filter")] = None,
-    has_pending_cta: Annotated[Optional[bool], Field(description="only tasks with a pending CTA")] = None,
+    status: Annotated[
+        Optional[list[str]],
+        Field(description="task.status filter; default ['pending_admin_review']")
+    ] = None,
     client_id: Annotated[Optional[str], Field(description="filter by client uuid")] = None,
+    matter_type: Annotated[Optional[list[str]], Field(description="project.matter_type filter")] = None,
+    claimed_by: Annotated[Optional[str], Field(description="filter by agent uuid that claimed the task")] = None,
     limit: Annotated[int, Field(ge=1, le=200)] = 50,
 ) -> dict:
-    """List tasks needing admin attention — DECISIONS §H.4 #1, L4.F1 shape lock."""
+    """Admin queue. Default sort: oldest submission first (FIFO), so the item
+    waiting longest rises to the top."""
     t0 = time.perf_counter()
-    statuses = status or ["pending", "in_progress", "awaiting_client"]
+    statuses = status or ["pending_admin_review"]
     sql = [
-        "SELECT t.id, t.title, t.status, t.tier, t.priority, t.pinned_pipeline_stage,",
+        "SELECT t.id, t.title, t.status, t.priority, t.revision_count,",
+        "       t.claimed_by_admin_id, t.claimed_at, t.delivered_at,",
         "       t.created_at, t.updated_at,",
+        "       rs.id AS review_submission_id, rs.submitted_at, rs.summary_for_admin,",
         "       p.id AS project_id, p.name AS project_name, p.matter_type,",
-        "       c.id AS client_id, c.name AS client_name, c.balance,",
-        "       (SELECT count(*) FROM cta WHERE task_id = t.id AND status = 'pending') AS pending_cta_count",
-        "  FROM task t JOIN project p ON p.id = t.project_id",
+        "       c.id AS client_id, c.name AS client_name",
+        "  FROM task t",
+        "  JOIN project p ON p.id = t.project_id",
         "  JOIN client c ON c.id = p.client_id",
+        "  LEFT JOIN review_submission rs",
+        "       ON rs.id = t.review_submission_id AND rs.resolved_at IS NULL",
         " WHERE t.status = ANY(%s)",
     ]
     params: list[Any] = [statuses]
-    if tier:
-        sql.append(" AND t.tier = ANY(%s)"); params.append(tier)
     if matter_type:
         sql.append(" AND p.matter_type = ANY(%s)"); params.append(matter_type)
     if client_id:
         sql.append(" AND c.id = %s"); params.append(client_id)
-    if has_pending_cta is not None:
-        cmp = ">" if has_pending_cta else "="
-        sql.append(f" AND (SELECT count(*) FROM cta WHERE task_id = t.id AND status = 'pending') {cmp} 0")
-    sql.append(" ORDER BY t.created_at DESC LIMIT %s")
-    params.append(limit)
+    if claimed_by:
+        sql.append(" AND t.claimed_by_admin_id = %s"); params.append(claimed_by)
+    # Oldest-submission-first when filtering the admin queue; otherwise newest created.
+    if statuses == ["pending_admin_review"]:
+        sql.append(" ORDER BY rs.submitted_at ASC NULLS LAST, t.created_at ASC")
+    else:
+        sql.append(" ORDER BY t.created_at DESC")
+    sql.append(" LIMIT %s"); params.append(limit)
 
     with conn() as c:
         with c.cursor() as cur:
             cur.execute("".join(sql), params)
             items = [_jsonable(r) for r in cur.fetchall()]
             audit(cur, tool_name="list_pending_tasks", tool_category="read",
-                  task_id=None, args={"statuses": statuses, "tier": tier, "limit": limit},
+                  task_id=None, args={"statuses": statuses, "limit": limit},
                   result={"count": len(items)}, duration_ms=duration_ms_since(t0))
     return {"items": items, "count": len(items)}
 
 
 @mcp.tool()
 def get_task(task_id: str) -> dict:
-    """Full task tree — DECISIONS §K.3.4 shape."""
+    """Full task tree: task + project + client + drafts + artifacts + chat +
+    review_submission (active) + latest revision_note + internal notes +
+    pipeline events + uploads."""
     t0 = time.perf_counter()
     with conn() as c:
         with c.cursor() as cur:
@@ -100,10 +122,8 @@ def get_task(task_id: str) -> dict:
                 _audit_error(cur, "get_task", "read", task_id, {"task_id": task_id}, "NOT_FOUND", t0)
                 raise ToolError("NOT_FOUND", "task not found")
 
-            cur.execute("SELECT * FROM chat_message WHERE task_id = %s ORDER BY created_at ASC LIMIT 100", (task_id,))
+            cur.execute("SELECT * FROM chat_message WHERE task_id = %s ORDER BY created_at ASC LIMIT 200", (task_id,))
             chat = [_jsonable(r) for r in cur.fetchall()]
-            cur.execute("SELECT * FROM cta WHERE task_id = %s ORDER BY created_at DESC", (task_id,))
-            ctas = [_jsonable(r) for r in cur.fetchall()]
             cur.execute("SELECT * FROM draft WHERE task_id = %s ORDER BY artifact_type, version DESC", (task_id,))
             drafts = [_jsonable(r) for r in cur.fetchall()]
             cur.execute("SELECT * FROM artifact WHERE task_id = %s ORDER BY delivered_at DESC NULLS LAST", (task_id,))
@@ -115,32 +135,45 @@ def get_task(task_id: str) -> dict:
             cur.execute("SELECT * FROM internal_note WHERE task_id = %s ORDER BY created_at DESC", (task_id,))
             notes = [_jsonable(r) for r in cur.fetchall()]
 
+            # Active submission (unresolved) + latest revision note
+            cur.execute("""
+                SELECT * FROM review_submission
+                 WHERE task_id = %s AND resolved_at IS NULL
+                 ORDER BY submitted_at DESC LIMIT 1
+            """, (task_id,))
+            active_submission = cur.fetchone()
+            cur.execute("""
+                SELECT * FROM revision_note WHERE task_id = %s
+                 ORDER BY created_at DESC LIMIT 1
+            """, (task_id,))
+            latest_revision = cur.fetchone()
+
             audit(cur, tool_name="get_task", tool_category="read",
                   task_id=task_id, args={"task_id": task_id},
-                  result={"has_data": True}, duration_ms=duration_ms_since(t0))
+                  result={"drafts": len(drafts), "artifacts": len(artifacts)},
+                  duration_ms=duration_ms_since(t0))
 
-    task = _jsonable(row)
     return {
-        "task": task,
+        "task": _jsonable(row),
         "chat_messages": chat,
-        "ctas": ctas,
         "drafts": drafts,
         "artifacts": artifacts,
         "uploads": uploads,
         "pipeline_events": pipeline,
         "internal_notes": notes,
+        "review_submission": _jsonable(active_submission) if active_submission else None,
+        "latest_revision_note": _jsonable(latest_revision) if latest_revision else None,
     }
 
 
 @mcp.tool()
 def get_client_profile(client_id: str, limit: Annotated[int, Field(ge=1, le=100)] = 20) -> dict:
-    """Client summary + past_projects — DECISIONS §R3.L3 shape."""
+    """Client summary + recent projects. No credit/balance (billing removed)."""
     t0 = time.perf_counter()
     with conn() as c:
         with c.cursor() as cur:
             cur.execute("""
-                SELECT id, name, email, sector, balance, total_credits_purchased,
-                       preferences_json, created_at
+                SELECT id, name, email, sector, preferences_json, created_at
                   FROM client WHERE id = %s AND deleted_at IS NULL
             """, (client_id,))
             client = cur.fetchone()
@@ -167,10 +200,8 @@ def get_client_profile(client_id: str, limit: Annotated[int, Field(ge=1, le=100)
 
 @mcp.tool()
 def read_upload(upload_id: str) -> dict:
-    """Upload metadata + OCR text — DECISIONS §K.3.5.
-
-    Returns VALIDATION_ERROR with details.reason='ocr_not_ready' when OCR hasn't run yet.
-    """
+    """Upload metadata + OCR text. VALIDATION_ERROR details.reason='ocr_not_ready'
+    when OCR hasn't run yet."""
     t0 = time.perf_counter()
     with conn() as c:
         with c.cursor() as cur:
@@ -201,13 +232,13 @@ def read_upload(upload_id: str) -> dict:
 
 @mcp.tool()
 def list_artifacts(task_id: str) -> dict:
-    """Metadata-only artifact refs — body fetched via get_artifact."""
+    """Metadata-only artifact refs for a task."""
     t0 = time.perf_counter()
     with conn() as c:
         with c.cursor() as cur:
             cur.execute("""
-                SELECT id, task_id, artifact_type, client_title, delivered_at,
-                       review_status, length(coalesce(client_note,'')) AS client_note_size
+                SELECT id, task_id, draft_id, client_title, delivered_at, delivered_by_admin_id,
+                       length(coalesce(client_note,'')) AS client_note_size
                   FROM artifact WHERE task_id = %s
                   ORDER BY delivered_at DESC NULLS LAST
             """, (task_id,))
@@ -220,31 +251,25 @@ def list_artifacts(task_id: str) -> dict:
 
 @mcp.tool()
 def get_artifact(artifact_id: str) -> dict:
-    """Artifact incl. source_draft body_markdown — DECISIONS §L4.F2."""
+    """Artifact with its snapshot body_markdown."""
     t0 = time.perf_counter()
     with conn() as c:
         with c.cursor() as cur:
-            cur.execute("""
-                SELECT a.*, d.body_markdown AS source_draft_body_markdown,
-                       d.version AS source_draft_version,
-                       d.title AS source_draft_title
-                  FROM artifact a JOIN draft d ON d.id = a.source_draft_id
-                 WHERE a.id = %s
-            """, (artifact_id,))
+            cur.execute("SELECT * FROM artifact WHERE id = %s", (artifact_id,))
             row = cur.fetchone()
             if not row:
                 _audit_error(cur, "get_artifact", "read", None, {"artifact_id": artifact_id}, "NOT_FOUND", t0)
                 raise ToolError("NOT_FOUND")
             audit(cur, tool_name="get_artifact", tool_category="read",
                   task_id=row["task_id"], args={"artifact_id": artifact_id},
-                  result={"artifact_type": row["artifact_type"]},
+                  result={"title": row["client_title"]},
                   duration_ms=duration_ms_since(t0))
     return _jsonable(row)
 
 
-# -----------------------------------------------------------------------------
-# 2. Knowledge (4)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Knowledge (regulations / precedents / client_knowledge)
+# =============================================================================
 
 @mcp.tool()
 def search_regulations(
@@ -253,7 +278,7 @@ def search_regulations(
     jenis: Annotated[Optional[list[str]], Field(description="e.g. ['UU','PP']")] = None,
     limit: Annotated[int, Field(ge=1, le=50)] = 10,
 ) -> dict:
-    """FTS-only search over regulation (pgvector hybrid arrives when embeddings are seeded)."""
+    """FTS over regulation (pgvector hybrid arrives when embeddings are seeded)."""
     t0 = time.perf_counter()
     statuses = status or ["active"]
     sql = [
@@ -284,7 +309,7 @@ def get_regulation(
     include_full_text: bool = False,
     top_n_chunks: Annotated[int, Field(ge=1, le=50)] = 5,
 ) -> dict:
-    """Regulation detail — capped at 200 chunks (DECISIONS §R3.L4)."""
+    """Regulation detail. Capped at 200 chunks when include_full_text."""
     t0 = time.perf_counter()
     with conn() as c:
         with c.cursor() as cur:
@@ -326,7 +351,7 @@ def search_precedents(
     matter_type: Annotated[Optional[list[str]], Field(description="filter by matter_type enum")] = None,
     limit: Annotated[int, Field(ge=1, le=30)] = 10,
 ) -> dict:
-    """FTS over curated precedent KB. Response includes `source_artifact_id` for hopping."""
+    """FTS over curated precedent KB."""
     t0 = time.perf_counter()
     sql = [
         "SELECT id, source_artifact_id, title, summary, matter_type, tags, created_at,",
@@ -377,102 +402,93 @@ def get_client_knowledge(
     return {"items": items, "count": len(items)}
 
 
-# -----------------------------------------------------------------------------
-# 3. Intake / Classification (2)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Cowork write tools
+# =============================================================================
 
 @mcp.tool()
-def send_cta(
-    task_id: str,
-    tier: Annotated[str, Field(pattern="^(standard|urgent|bulk)$")],
-    credit: Annotated[int, Field(ge=0)],
-    eta_text: Annotated[Optional[str], Field(description="free-form ETA string shown to client")] = None,
-    reasoning_note: Annotated[Optional[str], Field(description="why this tier+credit")] = None,
-) -> dict:
-    """Propose a CTA, schedule 15-min auto-confirm job. DECISIONS §K.2.1 transaction."""
-    t0 = time.perf_counter()
-    with conn() as c:
-        with c.cursor() as cur:
-            # Guard: no active pending CTA (H4 / DECISIONS §K.2.4)
-            cur.execute("SELECT count(*) AS n FROM cta WHERE task_id = %s::uuid AND status = 'pending'::cta_status", (task_id,))
-            if cur.fetchone()["n"] > 0:
-                _audit_error(cur, "send_cta", "write", task_id, {"task_id": task_id}, "STATE_ERROR", t0)
-                raise ToolError("STATE_ERROR", "Task already has a pending CTA")
-
-            cur.execute("""
-              INSERT INTO scheduled_job (job_type, payload_json, run_at)
-                   VALUES ('auto_confirm_cta'::scheduled_job_type, %s::jsonb, now() + interval '15 minutes')
-                RETURNING id
-            """, (Jsonb({"credit_snapshot": credit, "tier": tier}),))
-            job_id = cur.fetchone()["id"]
-
-            cur.execute("""
-              INSERT INTO cta (task_id, tier, credit, eta_text, reasoning_note,
-                               status, created_by_admin_id, auto_confirm_job_id)
-                   VALUES (%s::uuid, %s::task_tier, %s::int, %s::text, %s::text,
-                           'pending'::cta_status, %s::uuid, %s::uuid)
-                RETURNING id, created_at
-            """, (task_id, tier, credit, eta_text, reasoning_note, CONFIG.admin_worker_id, job_id))
-            cta = cur.fetchone()
-
-            cur.execute("""
-              UPDATE scheduled_job
-                 SET payload_json = payload_json || jsonb_build_object('cta_id', %s::text)
-               WHERE id = %s::uuid
-            """, (str(cta["id"]), str(job_id)))
-
-            cta_body = f"CTA {tier.upper()} · {credit} credit"
-            if eta_text:
-                cta_body += f" · {eta_text}"
-            cur.execute("""
-              INSERT INTO chat_message (task_id, sender_type, sender_admin_id,
-                                        message_type, body, cta_id)
-                   VALUES (%s::uuid, 'admin'::sender_type, %s::uuid,
-                           'cta_prompt'::chat_message_type, %s::text, %s::uuid)
-            """, (task_id, CONFIG.admin_worker_id, cta_body, cta["id"]))
-
-            pipeline_summary = f"CTA {tier} · {credit} cr proposed"
-            cur.execute("""
-              INSERT INTO pipeline_event (task_id, admin_worker_id, stage, source_tool, summary)
-                   VALUES (%s::uuid, %s::uuid, 'classify'::pipeline_stage,
-                           'send_cta'::text, %s::text)
-            """, (task_id, CONFIG.admin_worker_id, pipeline_summary))
-
-            cur.execute("UPDATE task SET status = 'awaiting_client'::task_status, updated_at = now() WHERE id = %s::uuid",
-                        (task_id,))
-
-            audit(cur, tool_name="send_cta", tool_category="write",
-                  task_id=task_id, args={"tier": tier, "credit": credit},
-                  result={"cta_id": str(cta["id"])}, duration_ms=duration_ms_since(t0))
-
-    return {"cta_id": str(cta["id"]), "auto_confirm_job_id": str(job_id), "status": "pending"}
-
-
-@mcp.tool()
-def post_chat_message(
-    task_id: str,
-    body: str,
-    message_type: Annotated[str, Field(pattern="^(standard|pipeline_update|system)$")] = "standard",
-) -> dict:
-    """Admin chat message. Non-CTA, non-artifact. No pipeline_event side-effect."""
+def claim_task(task_id: str) -> dict:
+    """Cowork claims a task. Idempotent for same caller. Transitions status
+    pending|revision_needed → cowork_working. Conflict if another agent holds it."""
     t0 = time.perf_counter()
     with conn() as c:
         with c.cursor() as cur:
             cur.execute("""
-              INSERT INTO chat_message (task_id, sender_type, sender_admin_id, message_type, body)
-                   VALUES (%s, 'admin', %s, %s::chat_message_type, %s)
-                RETURNING id, created_at
-            """, (task_id, CONFIG.admin_worker_id, message_type, body))
+                SELECT id, status, claimed_by_admin_id FROM task WHERE id = %s FOR UPDATE
+            """, (task_id,))
             row = cur.fetchone()
-            audit(cur, tool_name="post_chat_message", tool_category="write",
-                  task_id=task_id, args={"type": message_type, "body_len": len(body)},
-                  result={"message_id": str(row["id"])}, duration_ms=duration_ms_since(t0))
-    return {"message_id": str(row["id"]), "created_at": row["created_at"].isoformat()}
+            if not row:
+                _audit_error(cur, "claim_task", "write", None, {"task_id": task_id}, "NOT_FOUND", t0)
+                raise ToolError("NOT_FOUND", "task not found")
+
+            if row["claimed_by_admin_id"] and str(row["claimed_by_admin_id"]) != CONFIG.admin_worker_id:
+                _audit_error(cur, "claim_task", "write", task_id,
+                             {"task_id": task_id}, "CONFLICT", t0)
+                raise ToolError("CONFLICT",
+                                "task already claimed by a different agent",
+                                {"held_by": str(row["claimed_by_admin_id"])})
+
+            if row["status"] not in ("pending", "revision_needed", "cowork_working"):
+                _audit_error(cur, "claim_task", "write", task_id,
+                             {"task_id": task_id, "status": row["status"]}, "STATE_ERROR", t0)
+                raise ToolError("STATE_ERROR",
+                                f"cannot claim task in status '{row['status']}'")
+
+            reused = (
+                row["claimed_by_admin_id"]
+                and str(row["claimed_by_admin_id"]) == CONFIG.admin_worker_id
+                and row["status"] == "cowork_working"
+            )
+
+            cur.execute("""
+                UPDATE task
+                   SET claimed_by_admin_id = %s,
+                       claimed_at = coalesce(claimed_at, now()),
+                       status = 'cowork_working'::task_status,
+                       updated_at = now()
+                 WHERE id = %s
+             RETURNING claimed_at
+            """, (CONFIG.admin_worker_id, task_id))
+            claimed_at = cur.fetchone()["claimed_at"]
+
+            cur.execute("""
+                INSERT INTO pipeline_event (task_id, admin_worker_id, stage, source_tool, summary)
+                     VALUES (%s, %s, 'custom'::pipeline_stage, 'claim_task',
+                             %s)
+            """, (task_id, CONFIG.admin_worker_id,
+                  "task re-claimed after revision" if reused else "cowork claimed task"))
+
+            audit(cur, tool_name="claim_task", tool_category="write",
+                  task_id=task_id, args={"task_id": task_id},
+                  result={"reused": reused}, duration_ms=duration_ms_since(t0))
+
+    return {
+        "task_id": task_id,
+        "claimed_at": claimed_at.isoformat() if claimed_at else None,
+        "reused": reused,
+    }
 
 
-# -----------------------------------------------------------------------------
-# 4. Draft & Delivery (3)
-# -----------------------------------------------------------------------------
+@mcp.tool()
+def release_task(task_id: str) -> dict:
+    """Release claim (emergency escape). Does NOT change task.status — caller
+    decides whether to transition (e.g. back to `pending`)."""
+    t0 = time.perf_counter()
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.execute("""
+                UPDATE task
+                   SET claimed_by_admin_id = NULL, claimed_at = NULL, updated_at = now()
+                 WHERE id = %s AND claimed_by_admin_id = %s
+             RETURNING id
+            """, (task_id, CONFIG.admin_worker_id))
+            row = cur.fetchone()
+            audit(cur, tool_name="release_task", tool_category="write",
+                  task_id=task_id, args={"task_id": task_id},
+                  result={"released": bool(row)},
+                  duration_ms=duration_ms_since(t0))
+    return {"released": bool(row)}
+
 
 @mcp.tool()
 def save_draft(
@@ -483,7 +499,7 @@ def save_draft(
     source_refs: Annotated[Optional[list[dict]], Field(description="[{type:'regulation', regulation_id, article}, ...]")] = None,
     notes: Optional[str] = None,
 ) -> dict:
-    """Create a new draft version (append-only). Uses advisory lock per DECISIONS §L3.F3."""
+    """Append a draft. Version auto-increments per (task_id, artifact_type)."""
     return _insert_draft(task_id, artifact_type, title, body_markdown, source_refs, notes,
                          parent_draft_id=None, tool_name="save_draft")
 
@@ -496,17 +512,16 @@ def update_draft(
     source_refs: Optional[list[dict]] = None,
     notes: Optional[str] = None,
 ) -> dict:
-    """Fork a new draft version from an existing one (append-only, version+1)."""
+    """Fork a new version from an existing draft (append-only, version+1).
+    Use this after `reject_with_revision` to iterate."""
     if not any([body_markdown, title, source_refs, notes]):
         raise ToolError("VALIDATION_ERROR", "at least one mutable field is required")
-    t0 = time.perf_counter()
     with conn() as c:
         with c.cursor() as cur:
             cur.execute("SELECT * FROM draft WHERE id = %s", (draft_id,))
             parent = cur.fetchone()
             if not parent:
-                _audit_error(cur, "update_draft", "write", None, {"draft_id": draft_id}, "NOT_FOUND", t0)
-                raise ToolError("NOT_FOUND")
+                raise ToolError("NOT_FOUND", "parent draft not found")
     return _insert_draft(
         task_id=str(parent["task_id"]),
         artifact_type=parent["artifact_type"],
@@ -521,7 +536,6 @@ def update_draft(
 
 def _insert_draft(task_id, artifact_type, title, body_markdown, source_refs, notes,
                   parent_draft_id, tool_name):
-    import hashlib
     t0 = time.perf_counter()
     lock_key = int(hashlib.md5(f"draft:{task_id}:{artifact_type}".encode()).hexdigest()[:15], 16)
     with conn() as c:
@@ -534,17 +548,17 @@ def _insert_draft(task_id, artifact_type, title, body_markdown, source_refs, not
             version = cur.fetchone()["v"]
             cur.execute("""
               INSERT INTO draft (task_id, artifact_type, version, title, body_markdown,
-                                 source_refs_json, created_by_admin_id, parent_draft_id, notes)
-                   VALUES (%s, %s::artifact_type, %s, %s, %s, %s, %s, %s, %s)
+                                 source_refs_json, created_by_admin_id, parent_draft_id, notes,
+                                 review_status)
+                   VALUES (%s, %s::artifact_type, %s, %s, %s, %s, %s, %s, %s, 'pending')
                 RETURNING id, version, created_at
             """, (task_id, artifact_type, version, title, body_markdown,
                   Jsonb(source_refs or []), CONFIG.admin_worker_id, parent_draft_id, notes))
             row = cur.fetchone()
-            stage = "review" if tool_name == "update_draft" else "draft"
             cur.execute("""
               INSERT INTO pipeline_event (task_id, admin_worker_id, stage, source_tool, summary)
-                   VALUES (%s, %s, %s::pipeline_stage, %s, %s)
-            """, (task_id, CONFIG.admin_worker_id, stage, tool_name,
+                   VALUES (%s, %s, 'draft'::pipeline_stage, %s, %s)
+            """, (task_id, CONFIG.admin_worker_id, tool_name,
                   f"{artifact_type} v{version} {'revised' if parent_draft_id else 'drafted'}"))
             audit(cur, tool_name=tool_name, tool_category="write",
                   task_id=task_id, args={"artifact_type": artifact_type, "version": version},
@@ -553,171 +567,93 @@ def _insert_draft(task_id, artifact_type, title, body_markdown, source_refs, not
 
 
 @mcp.tool()
-def deliver_artifact(
-    draft_id: str,
-    client_title: str,
-    credit_deduct: Annotated[int, Field(ge=0)],
-    client_note: Optional[str] = None,
+def submit_for_review(
+    task_id: str,
+    draft_ids: Annotated[list[str], Field(description="drafts (by id) to include in this submission")],
+    summary_for_admin: Annotated[str, Field(description="what admin should know before reviewing (≤500 words)")],
 ) -> dict:
-    """Commit a draft as a delivered artifact. One atomic transaction — DECISIONS §K.2.2.
+    """Cowork: bundle drafts and hand off to admin for QA.
 
-    Side-effects:
-      1. UPDATE/INSERT artifact row (delivered_at, review_status='delivered')
-      2. INSERT credit_transaction (direction='debit', reason='delivery') — trigger updates client.balance
-      3. INSERT chat_message (message_type='artifact_delivery')
-      4. UPDATE task.status='delivered'
-      5. emit pipeline_event stage='delivered'
-      6. INSERT audit_log
+    Preconditions:
+      - task.status == 'cowork_working' and claimed_by caller
+      - every draft_id belongs to this task
+      - summary_for_admin non-empty
+
+    Effects (one transaction):
+      1. INSERT review_submission
+      2. UPDATE task.status = 'pending_admin_review', task.review_submission_id
+      3. INSERT pipeline_event
     """
+    if not draft_ids:
+        raise ToolError("VALIDATION_ERROR", "draft_ids must be non-empty")
+    if not summary_for_admin or not summary_for_admin.strip():
+        raise ToolError("VALIDATION_ERROR", "summary_for_admin must be non-empty")
+
     t0 = time.perf_counter()
     with conn() as c:
         with c.cursor() as cur:
-            # Load + lock client + validate state
             cur.execute("""
-                SELECT d.id AS draft_id, d.task_id, d.artifact_type::text AS artifact_type,
-                       t.status AS task_status, t.project_id,
-                       p.client_id, c.balance, c.deleted_at, c.name AS client_name
-                  FROM draft d
-                  JOIN task t ON t.id = d.task_id
-                  JOIN project p ON p.id = t.project_id
-                  JOIN client c ON c.id = p.client_id
-                 WHERE d.id = %s
-                 FOR UPDATE OF c
-            """, (draft_id,))
-            base = cur.fetchone()
-            if not base:
-                _audit_error(cur, "deliver_artifact", "write", None, {"draft_id": draft_id}, "NOT_FOUND", t0)
-                raise ToolError("NOT_FOUND", "draft not found")
-            if base["deleted_at"] is not None:
-                _audit_error(cur, "deliver_artifact", "write", base["task_id"],
-                             {"draft_id": draft_id}, "STATE_ERROR", t0)
-                raise ToolError("STATE_ERROR", "client soft-deleted")
-            if base["task_status"] == "delivered":
-                _audit_error(cur, "deliver_artifact", "write", base["task_id"],
-                             {"draft_id": draft_id}, "STATE_ERROR", t0)
-                raise ToolError("STATE_ERROR", "task already delivered")
-            if base["balance"] < credit_deduct:
-                _audit_error(cur, "deliver_artifact", "write", base["task_id"],
-                             {"draft_id": draft_id, "balance": base["balance"]},
-                             "INSUFFICIENT_BALANCE", t0)
-                raise ToolError("INSUFFICIENT_BALANCE",
-                                f"balance {base['balance']} < required {credit_deduct}")
-
-            # Most-recent accepted / auto-confirmed CTA
-            cur.execute("""
-                SELECT id, credit FROM cta
-                 WHERE task_id = %s AND status IN ('accepted','auto_confirmed')
-                 ORDER BY responded_at DESC NULLS LAST, created_at DESC LIMIT 1
-            """, (base["task_id"],))
-            cta = cur.fetchone()
-            if not cta:
-                _audit_error(cur, "deliver_artifact", "write", base["task_id"],
-                             {"draft_id": draft_id}, "STATE_ERROR", t0)
-                raise ToolError("STATE_ERROR", "no accepted CTA for task", {"reason": "no_cta"})
-            if cta["credit"] != credit_deduct:
-                _audit_error(cur, "deliver_artifact", "write", base["task_id"],
-                             {"cta_credit": cta["credit"], "requested": credit_deduct},
-                             "VALIDATION_ERROR", t0)
-                raise ToolError("VALIDATION_ERROR",
-                                f"credit_deduct {credit_deduct} != CTA agreed {cta['credit']}")
-
-            new_balance = base["balance"] - credit_deduct
-
-            # Upsert artifact row
-            cur.execute("SELECT id FROM artifact WHERE source_draft_id = %s", (draft_id,))
-            existing = cur.fetchone()
-            if existing:
-                artifact_id = existing["id"]
-                cur.execute("""
-                    UPDATE artifact
-                       SET client_title = %s, client_note = %s, review_status = 'delivered',
-                           delivered_at = now(), delivered_by_admin_id = %s
-                     WHERE id = %s
-                """, (client_title, client_note, CONFIG.admin_worker_id, artifact_id))
-            else:
-                cur.execute("""
-                    INSERT INTO artifact (task_id, source_draft_id, artifact_type,
-                                          delivered_by_admin_id, client_title, client_note,
-                                          delivered_at, review_status, created_by_admin_id)
-                         VALUES (%s, %s, %s::artifact_type, %s, %s, %s, now(),
-                                 'delivered', %s)
-                      RETURNING id
-                """, (base["task_id"], draft_id, base["artifact_type"],
-                      CONFIG.admin_worker_id, client_title, client_note, CONFIG.admin_worker_id))
-                artifact_id = cur.fetchone()["id"]
-
-            # Credit debit — trigger apply_credit_tx syncs client.balance
-            cur.execute("""
-                INSERT INTO credit_transaction (client_id, task_id, cta_id,
-                                                direction, reason, amount,
-                                                balance_after, performed_by_admin_id, notes)
-                     VALUES (%s, %s, %s, 'debit', 'delivery', %s, %s, %s,
-                             'deliver_artifact')
-                  RETURNING id
-            """, (base["client_id"], base["task_id"], cta["id"], credit_deduct,
-                  new_balance, CONFIG.admin_worker_id))
-            ct_id = cur.fetchone()["id"]
+                SELECT id, status, claimed_by_admin_id FROM task WHERE id = %s FOR UPDATE
+            """, (task_id,))
+            task = cur.fetchone()
+            if not task:
+                raise ToolError("NOT_FOUND", "task not found")
+            if task["status"] != "cowork_working":
+                _audit_error(cur, "submit_for_review", "write", task_id,
+                             {"status": task["status"]}, "STATE_ERROR", t0)
+                raise ToolError("STATE_ERROR",
+                                f"task status must be cowork_working (got {task['status']})")
+            if str(task["claimed_by_admin_id"] or "") != CONFIG.admin_worker_id:
+                _audit_error(cur, "submit_for_review", "write", task_id,
+                             {"held_by": str(task["claimed_by_admin_id"])}, "CONFLICT", t0)
+                raise ToolError("CONFLICT", "task not claimed by caller")
 
             cur.execute("""
-                INSERT INTO chat_message (task_id, sender_type, sender_admin_id,
-                                          message_type, body, artifact_id)
-                     VALUES (%s, 'admin', %s, 'artifact_delivery', %s, %s)
-            """, (base["task_id"], CONFIG.admin_worker_id,
-                  client_note or client_title, artifact_id))
+                SELECT id FROM draft WHERE task_id = %s AND id = ANY(%s)
+            """, (task_id, draft_ids))
+            found = {str(r["id"]) for r in cur.fetchall()}
+            missing = [d for d in draft_ids if d not in found]
+            if missing:
+                _audit_error(cur, "submit_for_review", "write", task_id,
+                             {"missing": missing}, "VALIDATION_ERROR", t0)
+                raise ToolError("VALIDATION_ERROR", "some drafts do not belong to this task",
+                                {"missing": missing})
 
-            cur.execute("UPDATE task SET status = 'delivered', updated_at = now() WHERE id = %s",
-                        (base["task_id"],))
-
-            pipeline_summary = f'Artifact "{client_title}" delivered to {base["client_name"]}'
             cur.execute("""
-                INSERT INTO pipeline_event (task_id, admin_worker_id, stage,
-                                            source_tool, summary)
-                     VALUES (%s, %s, 'delivered', 'deliver_artifact', %s)
-            """, (base["task_id"], CONFIG.admin_worker_id, pipeline_summary))
+                INSERT INTO review_submission
+                       (task_id, draft_ids, summary_for_admin, submitted_by_admin_id)
+                VALUES (%s, %s::uuid[], %s, %s)
+             RETURNING id, submitted_at
+            """, (task_id, draft_ids, summary_for_admin.strip(), CONFIG.admin_worker_id))
+            sub = cur.fetchone()
 
-            audit(cur, tool_name="deliver_artifact", tool_category="write",
-                  task_id=base["task_id"],
-                  args={"draft_id": draft_id, "credit_deduct": credit_deduct},
-                  result={"artifact_id": str(artifact_id), "new_balance": new_balance,
-                          "credit_transaction_id": str(ct_id)},
+            cur.execute("""
+                UPDATE task
+                   SET status = 'pending_admin_review'::task_status,
+                       review_submission_id = %s,
+                       updated_at = now()
+                 WHERE id = %s
+            """, (sub["id"], task_id))
+
+            cur.execute("""
+                INSERT INTO pipeline_event (task_id, admin_worker_id, stage, source_tool, summary)
+                     VALUES (%s, %s, 'review'::pipeline_stage, 'submit_for_review',
+                             %s)
+            """, (task_id, CONFIG.admin_worker_id,
+                  f"{len(draft_ids)} draft(s) submitted for admin review"))
+
+            audit(cur, tool_name="submit_for_review", tool_category="write",
+                  task_id=task_id,
+                  args={"draft_count": len(draft_ids)},
+                  result={"submission_id": str(sub["id"])},
                   duration_ms=duration_ms_since(t0))
 
     return {
-        "artifact_id": str(artifact_id),
-        "task_id": str(base["task_id"]),
-        "credit_transaction_id": str(ct_id),
-        "new_balance": new_balance,
+        "submission_id": str(sub["id"]),
+        "task_id": task_id,
+        "submitted_at": sub["submitted_at"].isoformat(),
+        "draft_count": len(draft_ids),
     }
-
-
-# -----------------------------------------------------------------------------
-# 5. State / Pipeline (4)
-# -----------------------------------------------------------------------------
-
-@mcp.tool()
-def log_pipeline_event(
-    task_id: str,
-    summary: str,
-    stage_label: Annotated[str, Field(description="Required since only stage='custom' is allowed")],
-    payload_json: Optional[dict] = None,
-) -> dict:
-    """Emit a custom pipeline stage — DECISIONS §H.4, only stage='custom' allowed via this tool."""
-    t0 = time.perf_counter()
-    with conn() as c:
-        with c.cursor() as cur:
-            cur.execute("""
-                INSERT INTO pipeline_event (task_id, admin_worker_id, stage, stage_label,
-                                            source_tool, summary, payload_json)
-                     VALUES (%s, %s, 'custom', %s, 'log_pipeline_event', %s, %s)
-                  RETURNING id, created_at
-            """, (task_id, CONFIG.admin_worker_id, stage_label, summary,
-                  Jsonb(payload_json or {})))
-            row = cur.fetchone()
-            audit(cur, tool_name="log_pipeline_event", tool_category="write",
-                  task_id=task_id, args={"stage_label": stage_label},
-                  result={"event_id": str(row["id"])},
-                  duration_ms=duration_ms_since(t0))
-    return {"event_id": str(row["id"]), "created_at": row["created_at"].isoformat()}
 
 
 @mcp.tool()
@@ -739,85 +675,310 @@ def add_internal_note(task_id: str, body: str) -> dict:
 
 
 @mcp.tool()
-def claim_task(task_id: str) -> dict:
-    """Open a cowork_session for task. Idempotent for same admin (re-returns active session)."""
+def log_pipeline_event(
+    task_id: str,
+    summary: str,
+    stage_label: Annotated[str, Field(description="required — only stage='custom' is allowed via this tool")],
+    payload_json: Optional[dict] = None,
+) -> dict:
+    """Emit a custom-labelled pipeline event. Use for ad-hoc milestones."""
     t0 = time.perf_counter()
     with conn() as c:
         with c.cursor() as cur:
             cur.execute("""
-                SELECT id, admin_worker_id FROM cowork_session
-                 WHERE task_id = %s AND ended_at IS NULL
+                INSERT INTO pipeline_event (task_id, admin_worker_id, stage, stage_label,
+                                            source_tool, summary, payload_json)
+                     VALUES (%s, %s, 'custom'::pipeline_stage, %s, 'log_pipeline_event', %s, %s)
+                  RETURNING id, created_at
+            """, (task_id, CONFIG.admin_worker_id, stage_label, summary,
+                  Jsonb(payload_json or {})))
+            row = cur.fetchone()
+            audit(cur, tool_name="log_pipeline_event", tool_category="write",
+                  task_id=task_id, args={"stage_label": stage_label},
+                  result={"event_id": str(row["id"])},
+                  duration_ms=duration_ms_since(t0))
+    return {"event_id": str(row["id"]), "created_at": row["created_at"].isoformat()}
+
+
+# =============================================================================
+# Admin write tools (QA gate)
+# =============================================================================
+
+@mcp.tool()
+def approve_and_deliver(
+    task_id: str,
+    client_title_overrides: Annotated[
+        Optional[dict[str, str]],
+        Field(description="{draft_id: new_title} — rename per-draft on delivery")
+    ] = None,
+    client_note: Annotated[Optional[str], Field(description="message shown to client in the chat bubble")] = None,
+    internal_note: Annotated[Optional[str], Field(description="admin-only note appended to task")] = None,
+) -> dict:
+    """Admin QA: approve the active review_submission and deliver every draft
+    as a snapshot artifact. One atomic transaction.
+
+    Effects:
+      1. UPDATE draft.review_status='approved' for each draft in submission
+      2. INSERT artifact (body_markdown snapshot) for each draft
+      3. UPDATE task.status='delivered', delivered_at=now()
+      4. UPDATE review_submission (resolved_at, resolution='approved')
+      5. INSERT chat_message (message_type='artifact_delivery') — single
+         aggregate bubble with artifact_refs array
+      6. Optional internal_note INSERT
+      7. Emit pipeline_event stage='delivered'
+      8. audit_log
+    """
+    t0 = time.perf_counter()
+    titles = client_title_overrides or {}
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.execute("""
+                SELECT t.id, t.status, t.review_submission_id,
+                       p.client_id, c.name AS client_name
+                  FROM task t
+                  JOIN project p ON p.id = t.project_id
+                  JOIN client c ON c.id = p.client_id
+                 WHERE t.id = %s
+                 FOR UPDATE OF t
             """, (task_id,))
-            existing = cur.fetchone()
-            if existing:
-                if str(existing["admin_worker_id"]) == CONFIG.admin_worker_id:
-                    audit(cur, tool_name="claim_task", tool_category="write",
-                          task_id=task_id, args={"task_id": task_id},
-                          result={"session_id": str(existing["id"]), "reused": True},
-                          duration_ms=duration_ms_since(t0))
-                    return {"session_id": str(existing["id"]), "reused": True}
-                _audit_error(cur, "claim_task", "write", task_id,
-                             {"task_id": task_id}, "CONFLICT", t0)
-                raise ToolError("CONFLICT",
-                                "task already claimed by a different admin",
-                                {"held_by_admin_id": str(existing["admin_worker_id"])})
+            base = cur.fetchone()
+            if not base:
+                _audit_error(cur, "approve_and_deliver", "write", None, {"task_id": task_id}, "NOT_FOUND", t0)
+                raise ToolError("NOT_FOUND", "task not found")
+            if base["status"] != "pending_admin_review":
+                _audit_error(cur, "approve_and_deliver", "write", task_id,
+                             {"status": base["status"]}, "STATE_ERROR", t0)
+                raise ToolError("STATE_ERROR",
+                                f"expected pending_admin_review, got {base['status']}")
+            if not base["review_submission_id"]:
+                raise ToolError("STATE_ERROR", "task has no active review_submission")
 
             cur.execute("""
-                INSERT INTO cowork_session (task_id, admin_worker_id, session_type)
-                     VALUES (%s, %s, 'normal') RETURNING id, started_at
-            """, (task_id, CONFIG.admin_worker_id))
-            row = cur.fetchone()
+                SELECT * FROM review_submission WHERE id = %s FOR UPDATE
+            """, (base["review_submission_id"],))
+            submission = cur.fetchone()
+            if not submission or submission["resolved_at"] is not None:
+                raise ToolError("STATE_ERROR", "review_submission not active")
+
+            draft_ids = [str(d) for d in submission["draft_ids"]]
             cur.execute("""
-                UPDATE task SET current_session_id = %s,
-                                status = CASE WHEN status = 'pending' THEN 'in_progress'::task_status
-                                              WHEN status = 'awaiting_client' THEN 'in_progress'::task_status
-                                              ELSE status END,
-                                updated_at = now()
+                SELECT id, task_id, artifact_type, title, body_markdown
+                  FROM draft WHERE id = ANY(%s::uuid[])
+            """, (draft_ids,))
+            drafts = cur.fetchall()
+            if len(drafts) != len(draft_ids):
+                raise ToolError("STATE_ERROR", "submission references missing drafts")
+
+            artifact_ids: list[str] = []
+            client_titles: list[str] = []
+            for d in drafts:
+                final_title = titles.get(str(d["id"])) or d["title"]
+                cur.execute("""
+                    INSERT INTO artifact
+                           (task_id, draft_id, artifact_type, client_title,
+                            body_markdown, client_note,
+                            delivered_by_admin_id, delivered_at,
+                            review_status, created_by_admin_id)
+                    VALUES (%s, %s, %s::artifact_type, %s, %s, %s, %s, now(),
+                            'delivered', %s)
+                 RETURNING id
+                """, (task_id, d["id"], d["artifact_type"], final_title,
+                      d["body_markdown"], client_note,
+                      CONFIG.admin_worker_id, CONFIG.admin_worker_id))
+                artifact_ids.append(str(cur.fetchone()["id"]))
+                client_titles.append(final_title)
+
+            cur.execute("""
+                UPDATE draft SET review_status = 'approved'
+                 WHERE id = ANY(%s::uuid[])
+            """, (draft_ids,))
+
+            cur.execute("""
+                UPDATE review_submission
+                   SET resolved_at = now(), resolution = 'approved'
                  WHERE id = %s
-            """, (row["id"], task_id))
-            audit(cur, tool_name="claim_task", tool_category="write",
-                  task_id=task_id, args={"task_id": task_id},
-                  result={"session_id": str(row["id"])},
+            """, (submission["id"],))
+
+            cur.execute("""
+                UPDATE task
+                   SET status = 'delivered'::task_status,
+                       delivered_at = now(),
+                       updated_at = now()
+                 WHERE id = %s
+            """, (task_id,))
+
+            if len(client_titles) == 1:
+                body = client_note or client_titles[0]
+            else:
+                listing = "\n".join(f"• {t}" for t in client_titles)
+                body = (client_note + "\n\n" + listing) if client_note else listing
+            cur.execute("""
+                INSERT INTO chat_message
+                       (task_id, sender_type, sender_admin_id, message_type,
+                        body, artifact_refs)
+                VALUES (%s, 'admin', %s, 'artifact_delivery', %s, %s::uuid[])
+            """, (task_id, CONFIG.admin_worker_id, body, artifact_ids))
+
+            if internal_note:
+                cur.execute("""
+                    INSERT INTO internal_note (task_id, admin_worker_id, body)
+                         VALUES (%s, %s, %s)
+                """, (task_id, CONFIG.admin_worker_id, internal_note))
+
+            cur.execute("""
+                INSERT INTO pipeline_event (task_id, admin_worker_id, stage, source_tool, summary)
+                     VALUES (%s, %s, 'delivered'::pipeline_stage, 'approve_and_deliver', %s)
+            """, (task_id, CONFIG.admin_worker_id,
+                  f"{len(artifact_ids)} artifact(s) delivered to {base['client_name']}"))
+
+            audit(cur, tool_name="approve_and_deliver", tool_category="write",
+                  task_id=task_id,
+                  args={"draft_count": len(draft_ids)},
+                  result={"artifact_ids": artifact_ids},
                   duration_ms=duration_ms_since(t0))
-    return {"session_id": str(row["id"]), "started_at": row["started_at"].isoformat(), "reused": False}
+
+    return {
+        "task_id": task_id,
+        "artifact_ids": artifact_ids,
+        "delivered_count": len(artifact_ids),
+    }
 
 
 @mcp.tool()
-def release_task(task_id: str) -> dict:
-    """Close the active cowork_session. Idempotent."""
+def reject_with_revision(
+    task_id: str,
+    overall_feedback: Annotated[str, Field(description="summary feedback — non-empty")],
+    priority: Annotated[str, Field(pattern="^(revise_all|revise_specific)$")] = "revise_all",
+    per_draft_feedback: Annotated[
+        Optional[dict[str, str]],
+        Field(description="{draft_id: feedback_text} — required when priority=revise_specific")
+    ] = None,
+    must_fix_items: Annotated[
+        Optional[list[str]],
+        Field(description="short bullets the cowork must address")
+    ] = None,
+) -> dict:
+    """Admin QA: send the submission back with structured notes. Cowork can
+    iterate via update_draft + submit_for_review again.
+
+    Effects:
+      1. INSERT revision_note
+      2. UPDATE draft.review_status='rejected' for drafts in submission
+      3. UPDATE review_submission (resolved_at, resolution='rejected')
+      4. UPDATE task.status='revision_needed', revision_count++,
+         latest_revision_note_id, clear claimed_by/claimed_at so cowork must
+         re-claim
+      5. Emit pipeline_event stage='custom' label='revision_requested'
+      6. audit_log
+    """
+    if not overall_feedback or not overall_feedback.strip():
+        raise ToolError("VALIDATION_ERROR", "overall_feedback must be non-empty")
+    per_draft = per_draft_feedback or {}
+    if priority == "revise_specific" and not per_draft:
+        raise ToolError("VALIDATION_ERROR",
+                        "per_draft_feedback required when priority=revise_specific")
+
     t0 = time.perf_counter()
     with conn() as c:
         with c.cursor() as cur:
             cur.execute("""
-                UPDATE cowork_session SET ended_at = now()
-                 WHERE task_id = %s AND admin_worker_id = %s AND ended_at IS NULL
-             RETURNING id
-            """, (task_id, CONFIG.admin_worker_id))
-            row = cur.fetchone()
-            if row:
-                cur.execute("UPDATE task SET current_session_id = NULL, updated_at = now() WHERE id = %s",
-                            (task_id,))
-            audit(cur, tool_name="release_task", tool_category="write",
-                  task_id=task_id, args={"task_id": task_id},
-                  result={"released": bool(row)},
+                SELECT id, status, review_submission_id, revision_count
+                  FROM task WHERE id = %s FOR UPDATE
+            """, (task_id,))
+            task = cur.fetchone()
+            if not task:
+                raise ToolError("NOT_FOUND", "task not found")
+            if task["status"] != "pending_admin_review":
+                _audit_error(cur, "reject_with_revision", "write", task_id,
+                             {"status": task["status"]}, "STATE_ERROR", t0)
+                raise ToolError("STATE_ERROR",
+                                f"expected pending_admin_review, got {task['status']}")
+            if not task["review_submission_id"]:
+                raise ToolError("STATE_ERROR", "task has no active review_submission")
+
+            cur.execute("""
+                SELECT draft_ids FROM review_submission WHERE id = %s FOR UPDATE
+            """, (task["review_submission_id"],))
+            submission = cur.fetchone()
+            valid_draft_ids = {str(d) for d in submission["draft_ids"]}
+            stray = [k for k in per_draft.keys() if k not in valid_draft_ids]
+            if stray:
+                raise ToolError("VALIDATION_ERROR",
+                                "per_draft_feedback references drafts not in submission",
+                                {"stray_draft_ids": stray})
+
+            cur.execute("""
+                INSERT INTO revision_note
+                       (task_id, review_submission_id, overall_feedback,
+                        per_draft_feedback, priority, must_fix_items,
+                        created_by_admin_id)
+                VALUES (%s, %s, %s, %s, %s, %s::text[], %s)
+             RETURNING id, created_at
+            """, (task_id, task["review_submission_id"],
+                  overall_feedback.strip(),
+                  Jsonb(per_draft),
+                  priority,
+                  must_fix_items or [],
+                  CONFIG.admin_worker_id))
+            note = cur.fetchone()
+
+            cur.execute("""
+                UPDATE draft SET review_status = 'rejected'
+                 WHERE id = ANY(%s::uuid[])
+            """, (list(valid_draft_ids),))
+
+            cur.execute("""
+                UPDATE review_submission
+                   SET resolved_at = now(), resolution = 'rejected'
+                 WHERE id = %s
+            """, (task["review_submission_id"],))
+
+            cur.execute("""
+                UPDATE task
+                   SET status = 'revision_needed'::task_status,
+                       latest_revision_note_id = %s,
+                       review_submission_id = NULL,
+                       revision_count = revision_count + 1,
+                       claimed_by_admin_id = NULL,
+                       claimed_at = NULL,
+                       updated_at = now()
+                 WHERE id = %s
+            """, (note["id"], task_id))
+
+            cur.execute("""
+                INSERT INTO pipeline_event
+                       (task_id, admin_worker_id, stage, stage_label,
+                        source_tool, summary, payload_json)
+                VALUES (%s, %s, 'custom'::pipeline_stage, 'revision_requested',
+                        'reject_with_revision', %s, %s)
+            """, (task_id, CONFIG.admin_worker_id,
+                  f"admin requested revision ({priority})",
+                  Jsonb({"must_fix_count": len(must_fix_items or [])})))
+
+            audit(cur, tool_name="reject_with_revision", tool_category="write",
+                  task_id=task_id,
+                  args={"priority": priority, "must_fix_count": len(must_fix_items or [])},
+                  result={"revision_note_id": str(note["id"]),
+                          "revision_count": task["revision_count"] + 1},
                   duration_ms=duration_ms_since(t0))
-    return {"released": bool(row)}
+
+    return {
+        "task_id": task_id,
+        "revision_note_id": str(note["id"]),
+        "revision_count": task["revision_count"] + 1,
+    }
 
 
-# -----------------------------------------------------------------------------
-# 6. Storage / local workspace (4) — for Cowork to work on files on disk
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Storage / workspace helpers (unchanged — orthogonal to the review flow)
+# =============================================================================
 
 @mcp.tool()
 def download_upload(
     upload_id: str,
     overwrite: Annotated[bool, Field(description="re-download even if a local copy exists")] = False,
 ) -> dict:
-    """Download one upload from Supabase Storage into the local workspace.
-
-    Returns the local path so subsequent tools (Read / filesystem MCP / shell)
-    can pick it up. Layout: `WIMA_WORKSPACE_DIR/<project_id>/<filename>`.
-    """
+    """Download one upload from Supabase Storage into the local workspace."""
     t0 = time.perf_counter()
     with conn() as c:
         with c.cursor() as cur:
@@ -869,7 +1030,7 @@ def download_task_uploads(
     task_id: str,
     overwrite: Annotated[bool, Field(description="re-download even if a local copy exists")] = False,
 ) -> dict:
-    """Download every upload attached to a task. Useful before kicking off a draft."""
+    """Download every upload attached to a task."""
     t0 = time.perf_counter()
     results: list[dict] = []
     errors: list[dict] = []
@@ -925,10 +1086,7 @@ def get_upload_signed_url(
     upload_id: str,
     expires_in_seconds: Annotated[int, Field(ge=30, le=7 * 24 * 3600)] = 3600,
 ) -> dict:
-    """Generate a time-limited HTTPS URL for an upload — useful when a tool
-    outside this MCP (browser / external API) needs direct access.
-    Default expiry 1h, maximum 7 days.
-    """
+    """Generate a time-limited HTTPS URL for an upload."""
     t0 = time.perf_counter()
     with conn() as c:
         with c.cursor() as cur:
@@ -967,10 +1125,7 @@ def get_upload_signed_url(
 def list_workspace_files(
     project_id: Annotated[Optional[str], Field(description="filter to one project_id folder")] = None,
 ) -> dict:
-    """List files currently cached in the local workspace. Pure local, no DB I/O.
-
-    Use this to check what Cowork already has on disk before re-downloading.
-    """
+    """List files currently cached in the local workspace."""
     base = CONFIG.workspace_dir
     items: list[dict] = []
     if project_id:
@@ -1000,9 +1155,9 @@ def list_workspace_files(
     }
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Internal helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 def _jsonable(row: dict) -> dict:
     """Convert uuid / datetime / Decimal to JSON-safe scalars."""
@@ -1035,9 +1190,9 @@ def _audit_error(cur, tool_name, category, task_id, args, code, t0):
           error=code, error_code=code)
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Entry point
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 def main() -> None:
     log.info("wima-mcp starting — admin_worker_id=%s", CONFIG.admin_worker_id)
