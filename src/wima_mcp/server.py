@@ -53,17 +53,22 @@ mcp = FastMCP(name="wima", instructions=(
 def list_pending_tasks(
     status: Annotated[
         Optional[list[str]],
-        Field(description="task.status filter; default ['pending_admin_review']")
+        Field(description=(
+            "task.status filter. Default ['pending','revision_needed','pending_admin_review']"
+            " — every actionable state. Pass ['pending_admin_review'] for just the admin QA queue,"
+            " or ['pending','revision_needed'] for just cowork's pickup queue."
+        ))
     ] = None,
     client_id: Annotated[Optional[str], Field(description="filter by client uuid")] = None,
     matter_type: Annotated[Optional[list[str]], Field(description="project.matter_type filter")] = None,
     claimed_by: Annotated[Optional[str], Field(description="filter by agent uuid that claimed the task")] = None,
     limit: Annotated[int, Field(ge=1, le=200)] = 50,
 ) -> dict:
-    """Admin queue. Default sort: oldest submission first (FIFO), so the item
-    waiting longest rises to the top."""
+    """Queue of tasks needing attention. Default: every non-delivered, non-
+    cancelled state. When filtering to ['pending_admin_review'] the sort is
+    FIFO by submitted_at (oldest review rises to the top)."""
     t0 = time.perf_counter()
-    statuses = status or ["pending_admin_review"]
+    statuses = status or ["pending", "revision_needed", "pending_admin_review"]
     sql = [
         "SELECT t.id, t.title, t.status, t.priority, t.revision_count,",
         "       t.claimed_by_admin_id, t.claimed_at, t.delivered_at,",
